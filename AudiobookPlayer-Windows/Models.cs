@@ -28,7 +28,8 @@ public sealed record Track(int Index, string Path, string Title);
 
 public sealed record Book(string Author, string Title, string Folder, string? FolderArt, IReadOnlyList<Track> Tracks)
 {
-    public string Id => $"{Author}|||{Title}";
+    /// author|||title. A second book with that same id gets |||folder so the two no longer share progress.
+    public string Id { get; set; } = "";
 }
 
 public sealed record AuthorGroup(string Name, List<Book> Books);

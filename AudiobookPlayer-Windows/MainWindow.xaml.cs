@@ -30,6 +30,9 @@ public partial class MainWindow : Window
         player.ChapterChanged += id => Dispatcher.InvokeAsync(() => ScrollChapterIntoView(id), DispatcherPriority.Background);
         player.BookmarkRequested += ShowBookmarkDialog;
 
+        EventManager.RegisterClassHandler(typeof(ContextMenu), ContextMenu.OpenedEvent, new RoutedEventHandler(OnContextMenuOpened));
+        EventManager.RegisterClassHandler(typeof(ContextMenu), ContextMenu.ClosedEvent, new RoutedEventHandler(OnContextMenuClosed));
+
         tray = new TrayService(player, ShowFromTray, ExitApp) { Visible = player.Settings.ShowTray };
 
         ChapterScrub.Dragged += f => player.SetChapterDrag(f);
@@ -102,8 +105,39 @@ public partial class MainWindow : Window
 
     // ── keyboard ─────────────────────────────────────────────
 
+    private int openMenus;
+
+    private void OnContextMenuOpened(object sender, RoutedEventArgs e)
+    {
+        if (MenuBelongsHere(sender)) openMenus++;
+    }
+
+    private void OnContextMenuClosed(object sender, RoutedEventArgs e)
+    {
+        if (MenuBelongsHere(sender)) openMenus = Math.Max(0, openMenus - 1);
+    }
+
+    private bool MenuBelongsHere(object sender)
+    {
+        if (sender is not System.Windows.Controls.ContextMenu menu) return false;
+        return menu.PlacementTarget is DependencyObject target && Window.GetWindow(target) == this;
+    }
+
+    private static bool FocusInsideMenu()
+    {
+        DependencyObject? current = Keyboard.FocusedElement as DependencyObject;
+        while (current != null)
+        {
+            if (current is System.Windows.Controls.ContextMenu or System.Windows.Controls.MenuItem or System.Windows.Controls.Menu)
+                return true;
+            current = VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current);
+        }
+        return false;
+    }
+
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
+        if (SpeedPopup.IsOpen || openMenus > 0 || FocusInsideMenu()) return;
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
         bool ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
         bool shift = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
@@ -156,7 +190,7 @@ public partial class MainWindow : Window
 
     private void BookPlay_Click(object sender, RoutedEventArgs e)
     {
-        if (Context<BookRowVM>(sender) is { } vm) { player.Open(vm.Book); player.Play(); }
+        if (Context<BookRowVM>(sender) is { } vm) player.Open(vm.Book, play: true);
     }
 
     private void BookReveal_Click(object sender, RoutedEventArgs e)
@@ -272,31 +306,5 @@ public partial class MainWindow : Window
             Filter = "Images|*.jpg;*.jpeg;*.png;*.bmp;*.gif|All files|*.*",
         };
         if (dlg.ShowDialog(this) == true) player.SetCover(dlg.FileName);
-    }
-
-    /// Let the mouse wheel continue to the page when the inner list hits its end.
-    private void InnerList_Wheel(object sender, MouseWheelEventArgs e)
-    {
-        if (sender is not DependencyObject d) return;
-        var sv = FindScrollViewer(d);
-        if (sv == null) return;
-        bool atTop = sv.VerticalOffset <= 0 && e.Delta > 0;
-        bool atBottom = sv.VerticalOffset >= sv.ScrollableHeight && e.Delta < 0;
-        if (sv.ScrollableHeight <= 0 || atTop || atBottom)
-        {
-            e.Handled = true;
-            MainScroll.ScrollToVerticalOffset(MainScroll.VerticalOffset - e.Delta);
-        }
-    }
-
-    private static ScrollViewer? FindScrollViewer(DependencyObject root)
-    {
-        if (root is ScrollViewer sv) return sv;
-        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
-        {
-            var found = FindScrollViewer(VisualTreeHelper.GetChild(root, i));
-            if (found != null) return found;
-        }
-        return null;
     }
 }

@@ -28,6 +28,18 @@ public sealed class NotNullToVis : IValueConverter
     public object ConvertBack(object? v, Type t, object? p, CultureInfo c) => throw new NotSupportedException();
 }
 
+/// Caps the now-playing chrome so the chapter list keeps the height that is left in the window.
+public sealed class ChromeMaxHeightConverter : IValueConverter
+{
+    public object Convert(object? v, Type t, object? p, CultureInfo c)
+    {
+        double total = v is double d && d > 0 ? d : 640;
+        return Math.Max(180d, total - 220d);
+    }
+
+    public object ConvertBack(object? v, Type t, object? p, CultureInfo c) => throw new NotSupportedException();
+}
+
 /// Visible when the bool is false.
 public sealed class InvBoolToVis : IValueConverter
 {

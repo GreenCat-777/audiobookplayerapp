@@ -10,8 +10,6 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using Windows.Storage;
 using WinMediaPlayer = Windows.Media.Playback.MediaPlayer;
-using WinPlaybackState = Windows.Media.Playback.MediaPlaybackState;
-using WinSource = Windows.Media.Core.MediaSource;
 using WinSmtc = Windows.Media.SystemMediaTransportControls;
 using WinSmtcButton = Windows.Media.SystemMediaTransportControlsButton;
 
@@ -24,6 +22,7 @@ public sealed class Player : ObservableObject
 
     private readonly Dispatcher ui;
     private readonly Store store;
+    private readonly AudioEngine engine = new();
     private readonly WinMediaPlayer mp = new();
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(250) };
     private WinSmtc? smtc;
@@ -138,7 +137,7 @@ public sealed class Player : ObservableObject
     public double Volume
     {
         get => volume;
-        set { value = Math.Clamp(value, 0, 1); if (Set(ref volume, value)) { mp.Volume = value; store.State.Volume = value; store.Save(); } }
+        set { value = Math.Clamp(value, 0, 1); if (Set(ref volume, value)) { engine.OutputVolume = value; store.State.Volume = value; store.Save(); } }
     }
 
     private double? chapterDrag, bookDrag;
@@ -221,12 +220,15 @@ public sealed class Player : ObservableObject
     // ── internals ────────────────────────────────────────────
     private int loadGen;
     private bool isLoading;
+    private bool playWhenReady;
     private DateTime lastSave = DateTime.MinValue;
     private DateTime pausedAt = DateTime.MinValue;
-    private TaskCompletionSource<bool>? openedTcs;
-    private WinSource? currentSource;
-    private Windows.Storage.Streams.IRandomAccessStream? currentStream;
     private string? lastCoverTemp;
+    private FileSystemWatcher? libraryWatch;
+    private string? libraryWatchPath;
+    private volatile bool libraryDirty;
+    private bool libraryWatchFailed;
+    private DateTime libraryRootStamp;
 
     public Player(Dispatcher dispatcher)
     {
@@ -234,15 +236,17 @@ public sealed class Player : ObservableObject
         store = new Store(ui);
 
         volume = store.State.Volume;
-        speed = store.State.Speed;
-        mp.Volume = volume;
-        mp.AutoPlay = false;
+        if (!engine.TrySetTempo(store.State.Speed))
+            store.State.Speed = engine.Tempo;
+        speed = engine.Tempo;
+        engine.OutputVolume = volume;
+        engine.Ended += () => ui.InvokeAsync(OnEngineEnded);
+        engine.Failed += message => ui.InvokeAsync(() =>
+        {
+            SetPlaying(false);
+            FailPlay(message);
+        });
         mp.CommandManager.IsEnabled = false;     // we drive the system media controls ourselves
-
-        mp.MediaOpened += (_, _) => openedTcs?.TrySetResult(true);
-        mp.MediaFailed += (_, _) => openedTcs?.TrySetResult(false);
-        mp.MediaEnded += (_, _) => ui.InvokeAsync(ItemEnded);
-        mp.PlaybackSession.PlaybackStateChanged += (_, _) => ui.InvokeAsync(OnPlaybackState);
 
         SetupSmtc();
 
@@ -260,7 +264,10 @@ public sealed class Player : ObservableObject
     {
         PersistPosition();
         store.Flush();
-        try { mp.Pause(); mp.Dispose(); } catch { }
+        libraryWatch?.Dispose();
+        libraryWatch = null;
+        engine.Dispose();
+        try { mp.Dispose(); } catch { /* media-key session is already going away */ }
     }
 
     // ═══ Library ═════════════════════════════════════════════
@@ -292,16 +299,75 @@ public sealed class Player : ObservableObject
         LoadLibrary(LibraryPath, restoreLast: false, silent: false);
     }
 
-    /// Quiet rescan when the window is re-activated, so new books just appear.
+    /// Quiet rescan when the window is activated, only if the library folder actually changed.
     public void RefreshLibrary()
     {
-        if (!LibraryLoaded || LibraryPath == null) return;
-        LoadLibrary(LibraryPath, restoreLast: false, silent: true);
+        if (!LibraryLoaded || LibraryPath is not { } path) return;
+        if (!Directory.Exists(path))
+        {
+            libraryDirty = true;   // scan once when the folder comes back; keep the list for now
+            return;
+        }
+        if (!LibraryFolderChanged(path)) return;
+        LoadLibrary(path, restoreLast: false, silent: true);
+    }
+
+    private void WatchLibrary(string path)
+    {
+        if (libraryWatch != null && string.Equals(libraryWatchPath, path, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        libraryWatch?.Dispose();
+        libraryWatch = null;
+        libraryWatchPath = path;
+        libraryDirty = false;
+        libraryWatchFailed = false;
+        try
+        {
+            var watch = new FileSystemWatcher(path)
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                InternalBufferSize = 64 * 1024,
+                EnableRaisingEvents = true,
+            };
+            FileSystemEventHandler onChange = (_, _) => libraryDirty = true;
+            watch.Created += onChange;
+            watch.Deleted += onChange;
+            watch.Changed += onChange;
+            watch.Renamed += (_, _) => libraryDirty = true;
+            watch.Error += (_, _) => libraryDirty = true;
+            libraryWatch = watch;
+        }
+        catch
+        {
+            // Some network paths cannot be watched. Fall back to the root directory timestamp,
+            // which does not enumerate files.
+            libraryWatchFailed = true;
+            libraryRootStamp = Directory.Exists(path) ? Directory.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+        }
+    }
+
+    private bool LibraryFolderChanged(string path)
+    {
+        if (libraryWatch != null) return libraryDirty;
+        if (!libraryWatchFailed) return false;
+        var stamp = Directory.GetLastWriteTimeUtc(path);
+        if (stamp == libraryRootStamp) return false;
+        libraryRootStamp = stamp;
+        return true;
     }
 
     private async void LoadLibrary(string path, bool restoreLast, bool silent)
     {
+        WatchLibrary(path);
+        libraryDirty = false;
         var found = await Task.Run(() => LibraryScanner.Scan(path));
+        if (libraryDirty)
+        {
+            libraryDirty = false;
+            found = await Task.Run(() => LibraryScanner.Scan(path));
+        }
         if (silent)
         {
             if (found.Count == 0 && authors.Count > 0 && !Directory.Exists(path)) return;   // drive unplugged: keep what we had
@@ -527,9 +593,13 @@ public sealed class Player : ObservableObject
 
     // ═══ Opening & loading ═══════════════════════════════════
 
-    public void Open(Book b)
+    public void Open(Book b, bool play = false)
     {
-        if (Book?.Id == b.Id) return;
+        if (Book?.Id == b.Id)
+        {
+            if (play) Play();
+            return;
+        }
         PersistPosition();
         outlineCts?.Cancel();
 
@@ -547,14 +617,19 @@ public sealed class Player : ObservableObject
         ChapterRows = new ObservableCollection<ChapterRowVM>();
         RebuildEntries();
         Raise(nameof(ChapterRows));
-        ApplySpeed(Settings.PerBookSpeed ? (st.Speed ?? 1.0) : store.State.Speed);
+        double desired = Settings.PerBookSpeed ? (st.Speed ?? 1.0) : store.State.Speed;
+        if (!ApplySpeed(desired))
+        {
+            if (Settings.PerBookSpeed) Mutate(b.Id, s => s.Speed = Speed);
+            else { store.State.Speed = Speed; store.Save(); }
+        }
         pausedAt = DateTime.MinValue;
 
         SetCoverImages(thumbs.TryGetValue(b.Id, out var t) ? t : null, null);   // instant placeholder while the real one loads
         LoadCoverFor(b);
 
         int idx = Math.Clamp(st.LastTrack, 0, b.Tracks.Count - 1);
-        LoadTrack(idx, st.Positions.GetValueOrDefault(idx), play: false);
+        LoadTrack(idx, st.Positions.GetValueOrDefault(idx), play);
         LoadOutline(b);
         RefreshBookmarkMeta();
         RefreshAllRows();
@@ -566,7 +641,10 @@ public sealed class Player : ObservableObject
     {
         if (Book is not { } b || index < 0 || index >= b.Tracks.Count) return;
         int gen = ++loadGen;
+        bool continuePlayback = play && IsPlaying;
         isLoading = true;
+        playWhenReady = play;
+        SetPlaying(false);
         TrackIndex = index;
         currentTime = seek;
         Duration = 0;
@@ -575,74 +653,59 @@ public sealed class Player : ObservableObject
         RefreshEntryIndex();
         RaiseTime();
 
-        var tcs = openedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         string path = b.Tracks[index].Path;
+        DecodedAudio? decoded = null;
+        string? error = null;
         try
         {
-            var file = await StorageFile.GetFileFromPathAsync(path);
-            var stream = await file.OpenReadAsync();
-            if (gen != loadGen) { stream.Dispose(); return; }
-            var src = WinSource.CreateFromStream(stream, ContentTypeFor(path));
-            var oldSource = currentSource; var oldStream = currentStream;
-            currentSource = src; currentStream = stream;
-            mp.Source = src;
-            oldSource?.Dispose();
-            oldStream?.Dispose();
+            decoded = await Task.Run(() => engine.Decode(path));
         }
-        catch
+        catch (Exception ex)
         {
-            if (gen == loadGen) { isLoading = false; Notify("Couldn't open that file"); }
-            return;
+            error = ex.Message;
         }
 
-        var winner = await Task.WhenAny(tcs.Task, Task.Delay(10000));
-        if (gen != loadGen) return;
-        if (winner != tcs.Task || !tcs.Task.Result)
+        if (gen != loadGen)
+        {
+            decoded?.Dispose();
+            return;
+        }
+        if (error != null || decoded == null)
         {
             isLoading = false;
-            Notify($"Couldn't play \"{b.Tracks[index].Title}\"");
+            playWhenReady = false;
+            FailPlay(string.IsNullOrWhiteSpace(error) ? $"Couldn't open \"{b.Tracks[index].Title}\"" : error);
             return;
         }
 
-        double dur = SafeSeconds(mp.PlaybackSession.NaturalDuration);
-        if (dur <= 0 && trackInfo.TryGetValue(index, out var known)) dur = known.Duration;
-        Duration = dur;
-        if (seek > 1) SafeSetPosition(Math.Min(seek, Math.Max(dur - 1, 0)));
-        try { mp.PlaybackSession.PlaybackRate = Speed; } catch { }
+        string? startError = engine.Use(decoded, seek);
+        if (gen != loadGen) return;
+        if (startError != null)
+        {
+            isLoading = false;
+            playWhenReady = false;
+            FailPlay($"Couldn't play \"{b.Tracks[index].Title}\". {startError}");
+            return;
+        }
 
+        Duration = engine.DurationSeconds;
+        if (Duration <= 0 && trackInfo.TryGetValue(index, out var known)) Duration = known.Duration;
+        currentTime = engine.PositionSeconds;
         isLoading = false;
         RefreshEntryIndex();
         RaiseTime();
-        if (play) Play();
         UpdateSmtc();
+        if (playWhenReady && gen == loadGen)
+        {
+            if (continuePlayback) pausedAt = DateTime.UtcNow;
+            Play();
+        }
 
         var tags = await Task.Run(() => TagService.Read(path));
         if (gen != loadGen) return;
         if (!string.IsNullOrWhiteSpace(tags.Title)) TrackTitle = tags.Title!;
         Narrator = tags.Narrator;
         UpdateSmtc();
-    }
-
-    private static double SafeSeconds(TimeSpan t)
-    {
-        double s = t.TotalSeconds;
-        return double.IsNaN(s) || double.IsInfinity(s) || s < 0 || s > 1e7 ? 0 : s;
-    }
-
-    private static string ContentTypeFor(string path) => Path.GetExtension(path).ToLowerInvariant() switch
-    {
-        ".mp3" => "audio/mpeg",
-        ".m4a" or ".m4b" => "audio/mp4",
-        ".aac" => "audio/aac",
-        ".flac" => "audio/flac",
-        ".wav" => "audio/wav",
-        ".wma" => "audio/x-ms-wma",
-        _ => "audio/mpeg",
-    };
-
-    private void SafeSetPosition(double seconds)
-    {
-        try { mp.PlaybackSession.Position = TimeSpan.FromSeconds(Math.Max(seconds, 0)); } catch { }
     }
 
     /// Reads durations + embedded chapter markers for every file in the book, in the background.
@@ -766,19 +829,35 @@ public sealed class Player : ObservableObject
     public void Play()
     {
         if (Book == null) { Notify("Open a library first"); return; }
+        if (isLoading) { playWhenReady = true; return; }
+
         int rewind = Settings.AutoRewind;
         if (rewind > 0 && !IsPlaying && currentTime > rewind && (DateTime.UtcNow - pausedAt).TotalSeconds > 10)
         {
             currentTime = Math.Max(currentTime - rewind, 0);
-            SafeSetPosition(currentTime);
+            if (!engine.Seek(currentTime))
+            {
+                FailPlay(engine.LastError ?? "Couldn't seek in this file");
+                return;
+            }
         }
-        mp.Play();
+
+        playWhenReady = false;
+        if (!engine.Play())
+        {
+            SetPlaying(false);
+            FailPlay(engine.LastError ?? "Couldn't start playback");
+            return;
+        }
+        SetPlaying(true);
     }
 
     public void Pause()
     {
-        mp.Pause();
+        playWhenReady = false;
+        engine.Pause();
         pausedAt = DateTime.UtcNow;
+        SetPlaying(false);
         PersistPosition();
     }
 
@@ -786,10 +865,14 @@ public sealed class Player : ObservableObject
 
     public void Seek(double t)
     {
-        if (Book == null) return;
+        if (Book == null || isLoading) return;
         double target = Math.Max(0, duration > 0 ? Math.Min(t, duration) : t);
-        currentTime = target;
-        SafeSetPosition(target);
+        if (!engine.Seek(target))
+        {
+            FailPlay(engine.LastError ?? "Couldn't seek in this file");
+            return;
+        }
+        currentTime = engine.PositionSeconds;
         RefreshEntryIndex();
         PersistPosition();
         RaiseTime();
@@ -899,17 +982,23 @@ public sealed class Player : ObservableObject
 
     // ═══ Speed ═══════════════════════════════════════════════
 
-    private void ApplySpeed(double s)
+    private bool ApplySpeed(double s)
     {
-        Speed = s;
-        try { mp.PlaybackSession.PlaybackRate = s; } catch { }
+        if (!engine.TrySetTempo(s))
+        {
+            Speed = engine.Tempo;
+            Notify($"Can't play at {s:0.##}x. Staying at {Speed:0.##}x.");
+            return false;
+        }
+        Speed = engine.Tempo;
+        return true;
     }
 
     public void SetSpeed(double s)
     {
-        ApplySpeed(s);
-        if (Settings.PerBookSpeed && Book is { } b) Mutate(b.Id, st => st.Speed = s);
-        else { store.State.Speed = s; store.Save(); }
+        if (!ApplySpeed(s)) return;
+        if (Settings.PerBookSpeed && Book is { } b) Mutate(b.Id, st => st.Speed = Speed);
+        else { store.State.Speed = Speed; store.Save(); }
         RaiseTime();
     }
 
@@ -923,11 +1012,17 @@ public sealed class Player : ObservableObject
 
     // ═══ Events from the media engine ════════════════════════
 
-    private void OnPlaybackState()
+    private void OnEngineEnded()
     {
-        var st = mp.PlaybackSession.PlaybackState;
-        bool playing = st == WinPlaybackState.Playing || st == WinPlaybackState.Buffering;
-        if (playing && !IsPlaying && Book is { } b) Mutate(b.Id, s => s.LastPlayed = DateTime.UtcNow);
+        if (isLoading) return;
+        SetPlaying(false);
+        ItemEnded();
+    }
+
+    private void SetPlaying(bool playing)
+    {
+        if (playing && !IsPlaying && Book is { } b)
+            Mutate(b.Id, s => s.LastPlayed = DateTime.UtcNow);
         IsPlaying = playing;
         foreach (var r in rows) r.IsPlaying = r.IsActive && playing;
         UpdateSmtc();
@@ -935,9 +1030,8 @@ public sealed class Player : ObservableObject
 
     private void Tick()
     {
-        if (isLoading || Book == null) return;
-        double pos;
-        try { pos = mp.PlaybackSession.Position.TotalSeconds; } catch { return; }
+        if (isLoading || Book == null || !engine.HasFile) return;
+        double pos = engine.PositionSeconds;
         if (double.IsNaN(pos) || double.IsInfinity(pos)) return;
         currentTime = pos;
         RefreshEntryIndex();
@@ -1055,11 +1149,11 @@ public sealed class Player : ObservableObject
         double original = volume;
         for (int step = 19; step >= 0; step--)
         {
-            mp.Volume = original * step / 20.0;
+            engine.OutputVolume = original * step / 20.0;
             await Task.Delay(200);
         }
         Pause();
-        mp.Volume = original;
+        engine.OutputVolume = original;
     }
 
     // ═══ Bookmarks ═══════════════════════════════════════════
@@ -1098,6 +1192,18 @@ public sealed class Player : ObservableObject
     public string DefaultBookmarkTitle => $"{ChapterTitle} - {Fmt.Time(currentTime)}";
 
     // ═══ Toast ═══════════════════════════════════════════════
+
+    private void FailPlay(string message, Exception? ex = null)
+    {
+        Notify(message);
+        try
+        {
+            Directory.CreateDirectory(store.BaseDir);
+            File.AppendAllText(Path.Combine(store.BaseDir, "error.log"),
+                $"{DateTime.Now:u} {message}{Environment.NewLine}{ex}{Environment.NewLine}{Environment.NewLine}");
+        }
+        catch { /* the toast already reported the failure */ }
+    }
 
     public async void Notify(string message)
     {

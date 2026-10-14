@@ -77,7 +77,35 @@ public static class LibraryScanner
     private static Book MakeBook(string author, string title, string[] files, string folder)
     {
         var tracks = files.Select((f, i) => new Track(i, f, CleanTitle(f))).ToList();
-        return new Book(author, title, folder, FolderArt(folder), tracks);
+        var book = new Book(author, title, folder, FolderArt(folder), tracks)
+        {
+            Id = $"{author}|||{title}",
+        };
+        return book;
+    }
+
+    /// First book keeps author|||title so saved progress still matches. Later collisions get the folder path.
+    internal static void DisambiguateIds(IReadOnlyList<Book> books)
+    {
+        var used = new HashSet<string>(StringComparer.Ordinal);
+        var seenBase = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var book in books)
+        {
+            string baseId = $"{book.Author}|||{book.Title}";
+            if (seenBase.Add(baseId))
+            {
+                book.Id = baseId;
+                used.Add(baseId);
+                continue;
+            }
+
+            string folder = book.Folder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string id = $"{baseId}|||{folder}";
+            int n = 2;
+            while (!used.Add(id))
+                id = $"{baseId}|||{folder}|||{n++}";
+            book.Id = id;
+        }
     }
 
     private static string CleanTitle(string file)
@@ -119,6 +147,8 @@ public static class LibraryScanner
 
         foreach (var f in LooseAudio(root))
             Add(MakeBook("Unsorted", Path.GetFileNameWithoutExtension(f), new[] { f }, root));
+
+        DisambiguateIds(byAuthor.Values.SelectMany(list => list).ToList());
 
         return byAuthor.Keys
             .OrderBy(k => k, NaturalComparer.Instance)
